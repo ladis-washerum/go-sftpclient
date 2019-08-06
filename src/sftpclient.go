@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"github.com/gofrs/flock"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"io"
@@ -11,22 +12,22 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
 const BufferSize = 1024
 
 /**
- * Addr : IP address of SFTP server
+ * Addr : IP address or FQDN of SFTP server
+ * Port : SFTP port
  * User : User to log in SFTP server
  * RemotePath : SFTP Path containing folder and files tree to access
- * RsaKeyFile : Absolute file to the local RSA key used for 'User' log in
+ * RsaKeyFile : Absolute path to the local RSA key used for 'User' log in
  */
 type SftpClient struct {
-	addr, user, remotePath, rsaKeyFile string
-	port                               int
-	client                             *sftp.Client
+	addr, port, user, remotePath, rsaKeyFile string
+	checkHostKey                             bool
+	client                                   *sftp.Client
 }
 
 /*
@@ -38,15 +39,17 @@ func (c *SftpClient) SetPath(path string) {
 
 /**
  * New etablish the connection and instanciate the new SFTP client
+ * check the host key in ~/.ssh/known_hosts if checkhostkey is true
  * Return a SftpClient struct
  */
-func New(addr string, port int, user string, remotepath string, rsakey string) (*SftpClient, error) {
+func New(addr, port, user, remotepath, rsakey string, checkhostkey bool) (*SftpClient, error) {
 	var sc SftpClient
 	sc.addr = addr
 	sc.user = user
 	sc.port = port
 	sc.remotePath = remotepath
 	sc.rsaKeyFile = rsakey
+	sc.checkHostKey = checkhostkey
 	key, err := ioutil.ReadFile(sc.rsaKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read private key: %v", err)
@@ -57,19 +60,27 @@ func New(addr string, port int, user string, remotepath string, rsakey string) (
 		return nil, fmt.Errorf("unable to parse private key: %v", err)
 	}
 
-	hostKey, err := getHostKey(sc.addr)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get host key: %v", err)
+	var hostKey ssh.PublicKey
+	var clbk ssh.HostKeyCallback
+	if sc.checkHostKey {
+		hostKey, err = getHostKey(sc.addr)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get host key: %v", err)
+		}
+		clbk = ssh.FixedHostKey(hostKey)
+	} else {
+		clbk = ssh.InsecureIgnoreHostKey()
 	}
+
 	config := &ssh.ClientConfig{
 		User: sc.user,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.FixedHostKey(hostKey),
+		HostKeyCallback: clbk,
 	}
 
-	sshClient, err := ssh.Dial("tcp", sc.addr+":"+strconv.Itoa(sc.port), config)
+	sshClient, err := ssh.Dial("tcp", sc.addr+":"+sc.port, config)
 	if err != nil {
 		return nil, fmt.Errorf("unable to connect to SFTP server: %v", err)
 	}
@@ -164,38 +175,43 @@ func (c *SftpClient) GetFiles(fileList []string) ([]string, error) {
  */
 func (c *SftpClient) PutFiles(fileList []string) error {
 	for _, file := range fileList {
-		fmt.Println("Processing file:", file)
 		//- Open local file
-		f, err := os.Open(file)
+		fileLock := flock.New(file)
+		locked, err := fileLock.TryLock()
 		if err != nil {
-			fmt.Errorf("unable to open file to push on SFTP server: %v", err)
+			return fmt.Errorf("unable to lock file: ", err)
 		}
-
-		//- Create SFTP file
-		filename := (*c).remotePath + "/" + path.Base(file)
-		//sf, err := (*c).client.OpenFile(filename, os.O_CREATE|os.O_WRONLY)
-		fmt.Println("filename:", filename)
-		sf, err := (*c).client.Create(filename)
-		if err != nil {
-			fmt.Errorf("unable to create SFTP file: %v", err)
-		}
-
-		//- Read chunck of data and write it into SFTP until EOF
-		buf := make([]byte, BufferSize)
-		for {
-			i, err := f.Read(buf)
+		if locked {
+			f, err := os.Open(file)
 			if err != nil {
-				if err == io.EOF {
-					break
+				fmt.Errorf("unable to open file to push on SFTP server: %v", err)
+			}
+
+			//- Create SFTP file
+			filename := (*c).remotePath + "/" + path.Base(file)
+			sf, err := (*c).client.Create(filename)
+			if err != nil {
+				fmt.Errorf("unable to create SFTP file: %v", err)
+			}
+
+			//- Read chunck of data and write it into SFTP until EOF
+			buf := make([]byte, BufferSize)
+			for {
+				i, err := f.Read(buf)
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					fmt.Errorf("unable to read local data: %v", err)
 				}
-				fmt.Errorf("unable to read local data: %v", err)
-			}
 
-			buf = buf[:i]
-			_, err = sf.Write(buf)
-			if err != nil {
-				fmt.Errorf("unable to write SFTP data: %v", err)
+				buf = buf[:i]
+				_, err = sf.Write(buf)
+				if err != nil {
+					fmt.Errorf("unable to write SFTP data: %v", err)
+				}
 			}
+			fileLock.Unlock()
 		}
 	}
 	return nil
